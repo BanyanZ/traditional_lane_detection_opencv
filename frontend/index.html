@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>车道线检测座舱</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body data-theme="green">
+    <main class="scene">
+      <div class="skyline" aria-hidden="true"></div>
+      <div class="cityscape" aria-hidden="true">
+        <div class="building tower-a"><span>AI</span></div>
+        <div class="building tower-b"><span>LANE</span></div>
+        <div class="building tower-c"><span>DATA</span></div>
+        <div class="building tower-d"><span>VISION</span></div>
+        <div class="building tower-e"><span>5G</span></div>
+        <div class="building tower-f"><span>AUTO</span></div>
+        <div class="building tower-g"><span>CV</span></div>
+      </div>
+      <div class="scan-layer" aria-hidden="true"></div>
+      <div class="road" aria-hidden="true">
+        <div class="lane lane-left"></div>
+        <div class="lane lane-center"></div>
+        <div class="lane lane-right"></div>
+        <div class="car car-a">
+          <span class="light left"></span>
+          <span class="light right"></span>
+        </div>
+        <div class="car car-b">
+          <span class="light left"></span>
+          <span class="light right"></span>
+        </div>
+      </div>
+
+      <section class="detector-window" aria-label="车道线检测窗口">
+        <header class="window-header">
+          <div>
+            <p class="eyebrow">Lane Intelligence Console</p>
+            <h1>车道线检测座舱</h1>
+          </div>
+          <span id="serverStatus" class="status">连接中</span>
+        </header>
+
+        <div class="preview-grid">
+          <figure class="preview-panel">
+            <figcaption>原始图像</figcaption>
+            <div id="sourcePreview" class="image-slot">
+              <span>等待选择图像</span>
+            </div>
+          </figure>
+          <figure class="preview-panel result-panel">
+            <figcaption>检测结果</figcaption>
+            <div id="resultPreview" class="image-slot">
+              <span>等待检测</span>
+            </div>
+          </figure>
+        </div>
+
+        <div class="command-deck" id="commandDeck">
+          <input id="fileInput" type="file" accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,image/*" hidden />
+          <button id="actionToggle" class="fab" type="button" aria-expanded="false" aria-controls="dockActions">
+            <span class="fab-icon">◎</span>
+            <span class="fab-label">操作</span>
+          </button>
+          <div id="dockActions" class="dock-actions" aria-label="检测操作">
+            <button id="openButton" class="button secondary" type="button">
+              <span class="button-icon">↥</span>
+              <span>打开</span>
+            </button>
+            <button id="detectButton" class="button primary" type="button" disabled>
+              <span class="button-icon">▶</span>
+              <span>检测</span>
+            </button>
+            <button id="saveButton" class="button secondary" type="button" disabled>
+              <span class="button-icon">⇩</span>
+              <span>保存</span>
+            </button>
+            <button id="themeButton" class="button theme" type="button">
+              <span class="button-icon">◐</span>
+              <span>换色</span>
+            </button>
+          </div>
+          <span id="fileName" class="file-name">未选择文件</span>
+        </div>
+
+        <div class="result-bar">
+          <div>
+            <span class="metric-label">实线</span>
+            <strong id="solidCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">虚线</span>
+            <strong id="dashedCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">总数</span>
+            <strong id="totalCount">0</strong>
+          </div>
+          <div>
+            <span class="metric-label">模式</span>
+            <strong id="profileLabel">-</strong>
+          </div>
+        </div>
+
+        <p id="message" class="message" hidden></p>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
