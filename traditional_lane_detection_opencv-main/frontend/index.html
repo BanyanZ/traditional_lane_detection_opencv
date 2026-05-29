@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>车道线检测</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body data-theme="green">
+    <!-- ========== 背景：闪烁霓虹的大楼 ========== -->
+    <div class="stage" aria-hidden="true">
+      <div class="sky"></div>
+      <div class="stars"></div>
+      <div class="city-far">
+        <span class="bg-tower" style="--x: 4%; --w: 60px; --h: 200px; --hue: 280deg"></span>
+        <span class="bg-tower" style="--x: 12%; --w: 80px; --h: 260px; --hue: 200deg"></span>
+        <span class="bg-tower" style="--x: 22%; --w: 50px; --h: 180px; --hue: 320deg"></span>
+        <span class="bg-tower" style="--x: 32%; --w: 90px; --h: 300px; --hue: 160deg"></span>
+        <span class="bg-tower" style="--x: 44%; --w: 70px; --h: 240px; --hue: 30deg"></span>
+        <span class="bg-tower" style="--x: 54%; --w: 100px; --h: 320px; --hue: 260deg"></span>
+        <span class="bg-tower" style="--x: 66%; --w: 60px; --h: 220px; --hue: 210deg"></span>
+        <span class="bg-tower" style="--x: 76%; --w: 80px; --h: 280px; --hue: 340deg"></span>
+        <span class="bg-tower" style="--x: 86%; --w: 70px; --h: 230px; --hue: 60deg"></span>
+        <span class="bg-tower" style="--x: 95%; --w: 50px; --h: 180px; --hue: 180deg"></span>
+      </div>
+      <div class="city-near">
+        <span class="neon-building neon-1">
+          <span class="neon-sign">CYBER</span>
+        </span>
+        <span class="neon-building neon-2">
+          <span class="neon-sign">NEON</span>
+        </span>
+        <span class="neon-building neon-3">
+          <span class="neon-sign">AI · DRIVE</span>
+        </span>
+        <span class="neon-building neon-4">
+          <span class="neon-sign">LANE</span>
+        </span>
+        <span class="neon-building neon-5">
+          <span class="neon-sign">VISION</span>
+        </span>
+        <span class="neon-building neon-6">
+          <span class="neon-sign">2046</span>
+        </span>
+      </div>
+      <div class="ground-glow"></div>
+
+      <!-- ========== 中间车道 + 小车 ========== -->
+      <div class="highway">
+        <div class="highway-floor"></div>
+        <div class="lane-stripes lane-1"></div>
+        <div class="lane-stripes lane-2"></div>
+        <div class="lane-stripes lane-3"></div>
+        <div class="lane-stripes lane-4"></div>
+        <div class="lane-edge lane-edge-left"></div>
+        <div class="lane-edge lane-edge-right"></div>
+
+        <div class="vehicle car-1">
+          <span class="vehicle-body"></span>
+          <span class="vehicle-glass"></span>
+          <span class="vehicle-light light-l"></span>
+          <span class="vehicle-light light-r"></span>
+          <span class="vehicle-glow"></span>
+        </div>
+        <div class="vehicle car-2">
+          <span class="vehicle-body"></span>
+          <span class="vehicle-glass"></span>
+          <span class="vehicle-light light-l"></span>
+          <span class="vehicle-light light-r"></span>
+          <span class="vehicle-glow"></span>
+        </div>
+        <div class="vehicle car-3">
+          <span class="vehicle-body"></span>
+          <span class="vehicle-glass"></span>
+          <span class="vehicle-light light-l"></span>
+          <span class="vehicle-light light-r"></span>
+          <span class="vehicle-glow"></span>
+        </div>
+      </div>
+
+      <div class="hud-grid"></div>
+      <div class="scan-sweep"></div>
+    </div>
+
+    <!-- ========== 主窗口 ========== -->
+    <main class="cockpit">
+      <section id="detectorWindow" class="detector-window" aria-label="车道线检测窗口">
+        <header class="window-header">
+          <div class="header-left">
+            <p class="eyebrow"><span class="eyebrow-dot"></span>Lane Intelligence Console</p>
+            <h1>车道线检测座舱</h1>
+            <p class="sub">经典 CV · 机器学习 · 自适应场景路由</p>
+          </div>
+          <div class="header-right">
+            <span id="serverStatus" class="status">连接中…</span>
+            <div class="cpu-indicator" title="实时检测计数">
+              <span class="cpu-label">SCAN</span>
+              <span id="scanCount" class="cpu-value">0</span>
+            </div>
+          </div>
+        </header>
+
+        <nav class="tabs" id="tabs" role="tablist">
+          <button class="tab active" data-tab="detect" role="tab">检测</button>
+          <button class="tab" data-tab="batch" role="tab">批量</button>
+          <button class="tab" data-tab="analytics" role="tab">分析</button>
+          <button class="tab" data-tab="about" role="tab">关于</button>
+        </nav>
+
+        <div class="panels">
+          <!-- ============ 检测面板 ============ -->
+          <section class="panel active" data-panel="detect">
+            <div class="preview-grid">
+              <figure class="preview-panel">
+                <figcaption>
+                  <span>原始图像</span>
+                  <span class="badge" id="sourceBadge">未载入</span>
+                </figcaption>
+                <div id="sourcePreview" class="image-slot drop-target">
+                  <span class="slot-placeholder">
+                    <span class="slot-ring"></span>
+                    点击 / 拖拽载入图像
+                  </span>
+                </div>
+              </figure>
+              <figure class="preview-panel result-panel">
+                <figcaption>
+                  <span>检测结果</span>
+                  <span class="badge" id="resultBadge">等待</span>
+                </figcaption>
+                <div id="resultPreview" class="image-slot">
+                  <span class="slot-placeholder">
+                    <span class="slot-ring scanring"></span>
+                    等待检测
+                  </span>
+                </div>
+              </figure>
+            </div>
+
+            <div class="command-deck" id="commandDeck">
+              <input id="fileInput" type="file" accept=".bmp,.jpg,.jpeg,.png,.tif,.tiff,image/*" hidden />
+              <button id="actionToggle" class="fab" type="button" aria-expanded="false" aria-controls="dockActions">
+                <span class="fab-icon">◎</span>
+                <span class="fab-label">操作</span>
+              </button>
+              <div id="dockActions" class="dock-actions" aria-label="检测操作">
+                <button id="openButton" class="button secondary" type="button">
+                  <span class="button-icon">↥</span>
+                  <span>打开</span>
+                </button>
+                <button id="detectButton" class="button primary" type="button" disabled>
+                  <span class="button-icon">▶</span>
+                  <span>检测</span>
+                </button>
+                <button id="saveButton" class="button secondary" type="button" disabled>
+                  <span class="button-icon">⇩</span>
+                  <span>保存</span>
+                </button>
+                <button id="sampleButton" class="button secondary" type="button">
+                  <span class="button-icon">★</span>
+                  <span>示例</span>
+                </button>
+                <button id="themeButton" class="button theme" type="button">
+                  <span class="button-icon">◐</span>
+                  <span>换色</span>
+                </button>
+              </div>
+              <span id="fileName" class="file-name">未选择文件</span>
+            </div>
+
+            <div class="result-bar">
+              <div class="lane-count-card">
+                <span class="metric-label">检测到车道线</span>
+                <strong><span id="laneCount">0</span><small>条</small></strong>
+              </div>
+              <div>
+                <span class="metric-label">识别策略</span>
+                <strong id="profileLabel">-</strong>
+                <span class="metric-sub" id="profileScript">—</span>
+              </div>
+              <div>
+                <span class="metric-label">模型置信度</span>
+                <strong id="confidenceLabel">-</strong>
+                <span class="bar-track"><span id="confidenceBar" class="bar-fill"></span></span>
+              </div>
+              <div>
+                <span class="metric-label">推理耗时</span>
+                <strong id="timeLabel">-</strong>
+                <span class="metric-sub">ms / 经典+ML 管线</span>
+              </div>
+            </div>
+
+            <details class="reason-box">
+              <summary>查看路由器决策依据</summary>
+              <p id="reasonText">尚未发起一次检测。</p>
+            </details>
+
+            <p id="message" class="message" hidden></p>
+          </section>
+
+          <!-- ============ 批量面板 ============ -->
+          <section class="panel" data-panel="batch">
+            <h2 class="panel-title">批量场景演示</h2>
+            <p class="panel-sub">选择素材分组，一键演示同一管线在不同光照/弯道下的表现。</p>
+            <div class="batch-grid" id="batchGrid"></div>
+          </section>
+
+          <!-- ============ 分析面板 ============ -->
+          <section class="panel" data-panel="analytics">
+            <h2 class="panel-title">检测历史</h2>
+            <p class="panel-sub">本次会话内累计的检测结果（不会上传）。</p>
+            <div class="history-summary">
+              <div class="history-card">
+                <span class="metric-label">累计检测</span>
+                <strong id="histTotal">0</strong>
+              </div>
+              <div class="history-card">
+                <span class="metric-label">平均车道线</span>
+                <strong id="histLaneAvg">0.0</strong>
+              </div>
+              <div class="history-card">
+                <span class="metric-label">平均耗时</span>
+                <strong id="histTime">0 ms</strong>
+              </div>
+            </div>
+            <ul class="history-list" id="historyList"></ul>
+          </section>
+
+          <!-- ============ 关于面板 ============ -->
+          <section class="panel" data-panel="about">
+            <h2 class="panel-title">算法栈</h2>
+            <ul class="stack-list">
+              <li><b>经典 CV：</b>CLAHE → ROI 多边形 → HSV/灰度阈值 → Canny → 形态学</li>
+              <li><b>霍夫线段：</b>多阈值 HoughLinesP + 连通域几何重建</li>
+              <li><b>机器学习：</b>RANSAC 直线/多项式拟合 · cv2.kmeans 车道分裂 · Logistic 场景分类器</li>
+              <li><b>弯道：</b>滑动窗口 + 二次多项式回归</li>
+              <li><b>可选 CNN：</b>PyTorch 极轻 3 层网络（自动降级）</li>
+            </ul>
+            <div class="hotkeys">
+              <h3>快捷键</h3>
+              <kbd>O</kbd> 打开图像 ・ <kbd>Enter</kbd> 检测 ・ <kbd>S</kbd> 保存结果 ・ <kbd>T</kbd> 换色
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <div id="imageModal" class="image-modal" hidden>
+        <button id="modalClose" class="modal-close" type="button" aria-label="关闭预览">×</button>
+        <img id="modalImage" alt="放大预览" />
+      </div>
+
+      <div id="toast" class="toast" hidden></div>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
