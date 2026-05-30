@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import sys
+import time
 from pathlib import Path
 
 import cv2
@@ -49,23 +50,26 @@ def detect():
     if image is None:
         return jsonify({"ok": False, "error": "图片读取失败，请换一张图片重试"}), 400
 
+    started = time.perf_counter()
     annotated, lanes, _, decision = detect_auto(image)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
 
     ok, buffer = cv2.imencode(".png", annotated)
     if not ok:
         return jsonify({"ok": False, "error": "检测结果编码失败"}), 500
 
-    solid_count = sum(1 for lane in lanes if lane.lane_type == "solid")
-    dashed_count = sum(1 for lane in lanes if lane.lane_type == "dashed")
+    lane_count = len(lanes)
+    curve_count = sum(1 for lane in lanes if getattr(lane, "is_curve", False))
     image_base64 = base64.b64encode(buffer).decode("ascii")
 
     return jsonify(
         {
             "ok": True,
             "fileName": source_name,
-            "solidCount": solid_count,
-            "dashedCount": dashed_count,
-            "totalCount": len(lanes),
+            "laneCount": lane_count,
+            "curveCount": curve_count,
+            "totalCount": lane_count,
+            "elapsedMs": elapsed_ms,
             "profileKey": decision.key,
             "profileLabel": decision.label,
             "profileScript": decision.script,

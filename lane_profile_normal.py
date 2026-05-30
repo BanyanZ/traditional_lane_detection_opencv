@@ -20,6 +20,10 @@ PROFILE = DetectionProfile(
     component_min_length=6,
     use_mask_components=False,
     hough_passes=((18, 16, 8), (12, 14, 7), (8, 10, 5)),
+    enable_ransac=True,
+    enable_kmeans=True,
+    enable_curve_fit=True,
+    enable_cnn=False,
 )
 
 

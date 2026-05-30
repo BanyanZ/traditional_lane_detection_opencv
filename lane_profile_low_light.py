@@ -34,6 +34,11 @@ PROFILE = DetectionProfile(
     structure_min_angle=10.0,
     structure_max_angle=75.0,
     structure_dilate=2,
+    enable_ransac=True,
+    enable_kmeans=True,
+    enable_curve_fit=True,
+    enable_cnn=True,
+    cnn_blend=0.6,
 )
 
 

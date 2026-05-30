@@ -7,7 +7,7 @@ from lane_line_detection import DetectionProfile, LaneCluster, detect_lanes
 
 PROFILE = DetectionProfile(
     key="complex",
-    label="多车道/遮挡/弯道",
+    label="多车道/弯道/遮挡",
     roi_top_ratio=0.46,
     clahe_clip=2.1,
     white_min=175,
@@ -23,6 +23,11 @@ PROFILE = DetectionProfile(
     use_mask_components=False,
     min_angle=10.0,
     hough_passes=((22, 18, 6), (15, 14, 5), (9, 10, 4)),
+    enable_ransac=True,
+    enable_kmeans=True,
+    enable_curve_fit=True,
+    curve_polyfit_degree=2,
+    enable_cnn=False,
 )
 
 

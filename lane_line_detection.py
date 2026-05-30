@@ -3,11 +3,18 @@ from __future__ import annotations
 import argparse
 import csv
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+from lane_ml import (
+    cnn_lane_mask,
+    kmeans_lane_seeds,
+    ransac_line,
+    ransac_polynomial,
+)
 
 
 IMAGE_SUFFIXES = {".bmp", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
@@ -27,8 +34,9 @@ class LaneSegment:
 @dataclass
 class LaneCluster:
     segments: list[LaneSegment]
-    lane_type: str
     fitted_line: tuple[int, int, int, int]
+    curve_points: list[tuple[int, int]] = field(default_factory=list)
+    is_curve: bool = False
 
 
 @dataclass(frozen=True)
@@ -43,11 +51,19 @@ class DetectionProfile:
     saturation_max: int = 95
     yellow_s_min: int = 45
     yellow_v_min: int = 90
+    channel_diff_min: int = 16
+    channel_diff_percentile: float = 88.0
+    channel_diff_std_scale: float = 0.35
     canny_low: int = 50
     canny_high: int = 150
     color_dilate: int = 5
     morph_open_size: int = 3
     morph_close_size: int = 5
+    glare_block_size: int = 20
+    glare_min_brightness: int = 225
+    glare_fill_min: float = 0.32
+    glare_max_aspect: float = 2.35
+    line_merge_kernel: int = 13
     component_min_area: int = 5
     component_min_length: int = 7
     component_max_area_ratio: float = 0.012
@@ -71,6 +87,13 @@ class DetectionProfile:
     structure_min_angle: float = 12.0
     structure_max_angle: float = 75.0
     structure_dilate: int = 3
+    # Machine-learning extensions ------------------------------------------------
+    enable_ransac: bool = True
+    enable_kmeans: bool = True
+    enable_curve_fit: bool = False
+    curve_polyfit_degree: int = 2
+    enable_cnn: bool = False
+    cnn_blend: float = 0.55
 
 
 DEFAULT_PROFILE = DetectionProfile(key="normal", label="正常光照")
@@ -100,14 +123,18 @@ def list_images(input_path: Path) -> list[Path]:
     )
 
 
-def region_of_interest(shape: tuple[int, int], top_ratio: float = 0.43) -> np.ndarray:
+def region_of_interest(
+    shape: tuple[int, int],
+    top_ratio: float = 0.43,
+) -> np.ndarray:
     height, width = shape
+    top_y = int(height * top_ratio)
     polygon = np.array(
         [
             [
                 (int(width * 0.03), height - 1),
-                (int(width * 0.24), int(height * top_ratio)),
-                (int(width * 0.76), int(height * top_ratio)),
+                (int(width * 0.24), top_y),
+                (int(width * 0.76), top_y),
                 (int(width * 0.97), height - 1),
             ]
         ],
@@ -135,6 +162,118 @@ def keep_lane_like_components(mask: np.ndarray) -> np.ndarray:
         if is_small_mark or is_long_mark:
             filtered[labels == idx] = 255
     return filtered
+
+
+def adaptive_threshold_from_roi(
+    values: np.ndarray,
+    floor: float,
+    percentile: float,
+    std_scale: float = 0.0,
+) -> int:
+    if values.size == 0:
+        return int(floor)
+    threshold = float(np.percentile(values, percentile))
+    if std_scale:
+        threshold += float(np.std(values)) * std_scale
+    return int(np.clip(max(floor, threshold), 0, 255))
+
+
+def rgb_channel_difference_mask(
+    image: np.ndarray,
+    roi: np.ndarray,
+    gray: np.ndarray,
+    profile: DetectionProfile,
+) -> tuple[np.ndarray, np.ndarray]:
+    b, g, r = cv2.split(image)
+    green_over_blue = cv2.subtract(g, b)
+    red_over_blue = cv2.subtract(r, b)
+    yellow_score = cv2.min(green_over_blue, red_over_blue)
+    diff_score = cv2.max(green_over_blue, yellow_score)
+
+    roi_values = diff_score[roi > 0]
+    threshold = adaptive_threshold_from_roi(
+        roi_values,
+        profile.channel_diff_min,
+        profile.channel_diff_percentile,
+        profile.channel_diff_std_scale,
+    )
+    if roi_values.size == 0 or int(roi_values.max()) < threshold:
+        return np.zeros_like(gray), diff_score
+
+    diff_mask = cv2.inRange(diff_score, threshold, 255)
+    gray_values = gray[roi > 0]
+    brightness_floor = adaptive_threshold_from_roi(gray_values, 70, 45.0)
+    diff_mask = cv2.bitwise_and(diff_mask, cv2.inRange(gray, brightness_floor, 255))
+    diff_mask = cv2.bitwise_and(diff_mask, roi)
+    return diff_mask, diff_score
+
+
+def remove_glare_components(
+    mask: np.ndarray,
+    gray: np.ndarray,
+    roi: np.ndarray,
+    profile: DetectionProfile,
+) -> np.ndarray:
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if count <= 1:
+        return mask
+
+    filtered = mask.copy()
+    roi_gray = gray[roi > 0]
+    glare_threshold = adaptive_threshold_from_roi(
+        roi_gray,
+        profile.glare_min_brightness,
+        98.0,
+    )
+    block = max(8, int(profile.glare_block_size))
+
+    for idx in range(1, count):
+        x, y, w, h, area = stats[idx]
+        if w < block or h < block:
+            continue
+
+        aspect = max(w, h) / max(1, min(w, h))
+        fill_ratio = area / max(1, w * h)
+        if aspect > profile.glare_max_aspect or fill_ratio < profile.glare_fill_min:
+            continue
+
+        component_pixels = labels == idx
+        bright_ratio = float(np.mean(gray[component_pixels] >= glare_threshold))
+        mean_brightness = float(np.mean(gray[component_pixels]))
+        if bright_ratio >= 0.42 or mean_brightness >= glare_threshold - 6:
+            filtered[component_pixels] = 0
+
+    return filtered
+
+
+def merge_lane_fragments(
+    mask: np.ndarray,
+    roi: np.ndarray,
+    profile: DetectionProfile,
+) -> np.ndarray:
+    kernel_size = int(profile.line_merge_kernel)
+    if kernel_size < 3:
+        return cv2.bitwise_and(mask, roi)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    kernels: list[np.ndarray] = []
+    for start, end in (((0, kernel_size - 1), (kernel_size - 1, 0)), ((0, 0), (kernel_size - 1, kernel_size - 1))):
+        kernel = np.zeros((kernel_size, kernel_size), dtype=np.uint8)
+        cv2.line(kernel, start, end, 1, 1)
+        kernels.append(kernel)
+
+    merged = mask.copy()
+    for kernel in kernels:
+        merged = cv2.bitwise_or(merged, cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel))
+
+    small_close = max(3, min(7, kernel_size // 2))
+    merged = cv2.morphologyEx(
+        merged,
+        cv2.MORPH_CLOSE,
+        np.ones((small_close, small_close), np.uint8),
+    )
+    return cv2.bitwise_and(merged, roi)
 
 
 def make_lane_mask(
@@ -167,8 +306,12 @@ def make_lane_mask(
         & cv2.inRange(s, profile.yellow_s_min, 255)
         & cv2.inRange(v, profile.yellow_v_min, 255)
     )
+    diff_mask, diff_score = rgb_channel_difference_mask(image, roi, gray, profile)
 
-    color_mask = cv2.bitwise_or(white_gray, cv2.bitwise_or(white_hsv, yellow_hsv))
+    color_mask = cv2.bitwise_or(
+        cv2.bitwise_or(white_gray, white_hsv),
+        cv2.bitwise_or(yellow_hsv, diff_mask),
+    )
     color_mask = cv2.bitwise_and(color_mask, roi)
     open_size = max(1, int(profile.morph_open_size))
     close_size = max(1, int(profile.morph_close_size))
@@ -180,6 +323,8 @@ def make_lane_mask(
         color_mask = cv2.morphologyEx(
             color_mask, cv2.MORPH_CLOSE, np.ones((close_size, close_size), np.uint8)
         )
+    color_mask = remove_glare_components(color_mask, gray, roi, profile)
+    color_mask = merge_lane_fragments(color_mask, roi, profile)
     if float(np.mean(gray)) < 85:
         color_mask = keep_lane_like_components(color_mask)
 
@@ -188,6 +333,14 @@ def make_lane_mask(
         color_mask, np.ones((profile.color_dilate, profile.color_dilate), np.uint8), iterations=1
     )
     lane_edges = cv2.bitwise_and(edges, expanded_color)
+    if np.any(diff_mask):
+        diff_blur = cv2.GaussianBlur(diff_score, (5, 5), 0)
+        diff_edges = cv2.Canny(
+            diff_blur,
+            max(12, profile.canny_low // 2),
+            max(30, profile.canny_high // 2),
+        )
+        lane_edges = cv2.bitwise_or(lane_edges, cv2.bitwise_and(diff_edges, expanded_color))
     lane_edges = cv2.bitwise_and(lane_edges, roi)
 
     if profile.use_structure_edges:
@@ -239,6 +392,14 @@ def make_lane_mask(
 
                 cv2.line(support_mask, (x1, y1), (x2, y2), 255, profile.structure_dilate)
         lane_edges = cv2.bitwise_or(lane_edges, support_mask)
+
+    if profile.enable_cnn:
+        cnn_mask = cnn_lane_mask(image)
+        if cnn_mask is not None:
+            cnn_mask = cv2.bitwise_and(cnn_mask, roi)
+            lane_edges = cv2.bitwise_or(lane_edges, cnn_mask)
+            color_mask = cv2.bitwise_or(color_mask, cnn_mask)
+
     return lane_edges, color_mask
 
 
@@ -444,96 +605,43 @@ def cluster_segments(segments: list[LaneSegment], image_shape: tuple[int, int]) 
     return [c for c in clusters if sum(s.length for s in c) >= 24]
 
 
-def merged_y_intervals(segments: list[LaneSegment], merge_gap: int = 10) -> list[tuple[int, int]]:
-    intervals = sorted((min(s.y1, s.y2), max(s.y1, s.y2)) for s in segments)
-    if not intervals:
-        return []
+def kmeans_post_split(
+    cluster: list[LaneSegment], image_shape: tuple[int, int]
+) -> list[list[LaneSegment]]:
+    """Use cv2.kmeans on segment bottom-x to split lanes that were merged by chance."""
+    if len(cluster) < 6:
+        return [cluster]
+    height, width = image_shape
+    avg_slope = float(np.mean([s.slope for s in cluster]))
+    if abs(avg_slope) < 0.05:
+        return [cluster]
 
-    merged = [intervals[0]]
-    for start, end in intervals[1:]:
-        last_start, last_end = merged[-1]
-        if start <= last_end + merge_gap:
-            merged[-1] = (last_start, max(last_end, end))
-        else:
-            merged.append((start, end))
-    return merged
+    xs = np.array([[seg.x_bottom] for seg in cluster], dtype=np.float32)
+    spread = float(np.std(xs))
+    if spread < max(20, width * 0.06):
+        return [cluster]
 
+    seeds_pts = np.array([[seg.x_bottom, (seg.y1 + seg.y2) / 2] for seg in cluster], dtype=np.float32)
+    seeds = kmeans_lane_seeds(seeds_pts, max_clusters=3, image_width=width)
+    if len(seeds) < 2:
+        return [cluster]
 
-def segment_groups_by_y(segments: list[LaneSegment], merge_gap: int = 9) -> list[list[LaneSegment]]:
-    ordered = sorted(
-        segments,
-        key=lambda item: (min(item.y1, item.y2), (item.x1 + item.x2) / 2),
-    )
-    groups: list[list[LaneSegment]] = []
-    x_gap = 28
+    output: list[list[LaneSegment]] = [[] for _ in seeds]
+    for seg in cluster:
+        best_idx = 0
+        best_dist = float("inf")
+        for idx, group in enumerate(seeds):
+            if group.size == 0:
+                continue
+            target = float(np.mean(group[:, 0]))
+            dist = abs(seg.x_bottom - target)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = idx
+        output[best_idx].append(seg)
 
-    for seg in ordered:
-        start = min(seg.y1, seg.y2)
-        end = max(seg.y1, seg.y2)
-
-        placed = False
-        center_x = (seg.x1 + seg.x2) / 2
-        for group in reversed(groups):
-            group_end = max(max(item.y1, item.y2) for item in group)
-            group_center = float(np.mean([(item.x1 + item.x2) / 2 for item in group]))
-            if start <= group_end + merge_gap and abs(center_x - group_center) <= x_gap:
-                group.append(seg)
-                placed = True
-                break
-
-        if not placed:
-            groups.append([seg])
-
-    return groups
-
-
-def classify_lane(segments: list[LaneSegment], image_height: int, image_width: int) -> str:
-    intervals = merged_y_intervals(segments, merge_gap=12)
-    if not intervals:
-        return "unknown"
-
-    span = max(end for _, end in intervals) - min(start for start, _ in intervals)
-    coverage = sum(end - start for start, end in intervals)
-    gap_ratio = 1.0 - (coverage / span) if span > 0 else 0.0
-    avg_len = float(np.mean([s.length for s in segments]))
-    total_len = sum(s.length for s in segments)
-    avg_abs_slope = float(np.mean([abs(s.slope) for s in segments]))
-    avg_x_bottom = float(np.mean([s.x_bottom for s in segments]))
-    is_side_boundary = avg_x_bottom < image_width * 0.18 or avg_x_bottom > image_width * 0.82
-    max_y = max(max(s.y1, s.y2) for s in segments)
-
-    if (
-        is_side_boundary
-        and max_y > image_height * 0.66
-        and total_len > image_height * 0.55
-        and (len(intervals) == 1 or (gap_ratio < 0.14 and avg_len > 28))
-    ):
-        return "solid"
-    if len(intervals) >= 2 and (gap_ratio > 0.28 or avg_len < 48):
-        return "dashed"
-    if len(segments) >= 3 and gap_ratio > 0.34:
-        return "dashed"
-    if (
-        len(intervals) == 1
-        and len(segments) >= 2
-        and avg_abs_slope < 0.38
-        and avg_len > 45
-        and avg_x_bottom < -image_width * 0.18
-    ):
-        return "solid"
-    if (
-        len(intervals) == 1
-        and len(segments) >= 4
-        and gap_ratio < 0.18
-        and span > image_height * 0.22
-        and total_len > image_height * 1.4
-    ):
-        return "solid"
-    if len(intervals) == 1 and len(segments) >= 3 and total_len > image_height * 1.0 and avg_len > 70:
-        return "solid"
-    if span < image_height * 0.34 and coverage < image_height * 0.42 and avg_len < image_height * 0.45:
-        return "dashed"
-    return "solid"
+    output = [group for group in output if len(group) >= 2]
+    return output if len(output) > 1 else [cluster]
 
 
 def cluster_x_at_y(segments: list[LaneSegment], y: float, image_width: int) -> float | None:
@@ -577,6 +685,59 @@ def clusters_are_close(
     return min(distances) <= max(18, width * 0.075)
 
 
+def cluster_y_range(segments: list[LaneSegment]) -> tuple[int, int]:
+    y_values = [s.y1 for s in segments] + [s.y2 for s in segments]
+    return min(y_values), max(y_values)
+
+
+def clusters_are_path_continuation(
+    left: list[LaneSegment],
+    right: list[LaneSegment],
+    image_shape: tuple[int, int, int],
+) -> bool:
+    height, width = image_shape[:2]
+    left_angle = float(np.mean([segment_angle(s) for s in left]))
+    right_angle = float(np.mean([segment_angle(s) for s in right]))
+    left_slope = float(np.mean([s.slope for s in left]))
+    right_slope = float(np.mean([s.slope for s in right]))
+
+    if (left_slope >= 0) != (right_slope >= 0) and min(left_angle, right_angle) > 18:
+        return False
+    if abs(left_angle - right_angle) > 32 and min(left_angle, right_angle) > 16:
+        return False
+
+    left_min_y, left_max_y = cluster_y_range(left)
+    right_min_y, right_max_y = cluster_y_range(right)
+    overlap_start = max(left_min_y, right_min_y)
+    overlap_end = min(left_max_y, right_max_y)
+    probe_values: list[float] = []
+
+    if overlap_end - overlap_start >= height * 0.045:
+        probe_values.extend(
+            [
+                overlap_start + (overlap_end - overlap_start) * 0.35,
+                overlap_start + (overlap_end - overlap_start) * 0.65,
+            ]
+        )
+    else:
+        gap = max(0, max(left_min_y, right_min_y) - min(left_max_y, right_max_y))
+        if gap > height * 0.22:
+            return False
+        probe_values.append((left_min_y + left_max_y + right_min_y + right_max_y) / 4)
+
+    distances = []
+    for y in probe_values:
+        lx = cluster_x_at_y(left, y, width)
+        rx = cluster_x_at_y(right, y, width)
+        if lx is not None and rx is not None:
+            distances.append(abs(lx - rx))
+
+    if not distances:
+        return False
+
+    return min(distances) <= max(24, width * 0.105)
+
+
 def lane_quality_score(lane: LaneCluster, image_shape: tuple[int, int, int]) -> float:
     height, width = image_shape[:2]
     total_len = sum(s.length for s in lane.segments)
@@ -586,8 +747,74 @@ def lane_quality_score(lane: LaneCluster, image_shape: tuple[int, int, int]) -> 
     avg_x_bottom = float(np.mean([s.x_bottom for s in lane.segments]))
     outside = max(0.0, -avg_x_bottom, avg_x_bottom - width)
     bottom_bonus = (max_y / max(1, height)) * 80
-    type_bonus = 25 if lane.lane_type == "solid" else 10
-    return total_len + span * 1.8 + bottom_bonus + type_bonus - outside * 0.75
+    curve_bonus = 15 if lane.is_curve else 0
+    return total_len + span * 1.8 + bottom_bonus + curve_bonus - outside * 0.75
+
+
+def lane_is_probable_noise(lane: LaneCluster, image_shape: tuple[int, int, int]) -> bool:
+    height, width = image_shape[:2]
+    total_len = sum(s.length for s in lane.segments)
+    y_values = [s.y1 for s in lane.segments] + [s.y2 for s in lane.segments]
+    min_y = min(y_values)
+    max_y = max(y_values)
+    span = max_y - min_y
+    avg_angle = float(np.mean([segment_angle(s) for s in lane.segments]))
+    avg_x_bottom = float(np.mean([s.x_bottom for s in lane.segments]))
+    shallow_count = sum(1 for s in lane.segments if is_shallow_mark(s, (height, width)))
+    non_shallow_len = sum(
+        s.length for s in lane.segments if not is_shallow_mark(s, (height, width))
+    )
+    lower_len = sum(s.length for s in lane.segments if max(s.y1, s.y2) >= height * 0.68)
+    center_bottom = width * 0.12 <= avg_x_bottom <= width * 0.88
+
+    if lane.is_curve and total_len > height * 0.28:
+        return False
+    if shallow_count == len(lane.segments):
+        return True
+    if shallow_count and non_shallow_len < max(26, height * 0.13):
+        return True
+    if avg_angle < 13 and span < height * 0.24:
+        return True
+    if max_y < height * 0.70 and total_len < height * 0.42:
+        return True
+    if avg_angle < 18 and center_bottom and total_len < height * 0.45 and lower_len < height * 0.12:
+        return True
+    if len(lane.segments) <= 2 and max_y < height * 0.70 and total_len < height * 0.34:
+        return True
+    if max_y < height * 0.58 and total_len < height * 0.50:
+        return True
+    if span < height * 0.12 and total_len < height * 0.55:
+        return True
+
+    return False
+
+
+def lanes_are_duplicate(
+    current: LaneCluster,
+    selected: LaneCluster,
+    image_shape: tuple[int, int, int],
+) -> bool:
+    height, width = image_shape[:2]
+    current_slope = float(np.mean([s.slope for s in current.segments]))
+    selected_slope = float(np.mean([s.slope for s in selected.segments]))
+    current_angle = float(np.mean([segment_angle(s) for s in current.segments]))
+    selected_angle = float(np.mean([segment_angle(s) for s in selected.segments]))
+
+    if (current_slope >= 0) != (selected_slope >= 0) and min(current_angle, selected_angle) > 18:
+        return False
+    if abs(current_angle - selected_angle) > 30 and min(current_angle, selected_angle) > 16:
+        return False
+
+    distances = []
+    for y in (height * 0.56, height * 0.70, height * 0.84):
+        cx = cluster_x_at_y(current.segments, y, width)
+        sx = cluster_x_at_y(selected.segments, y, width)
+        if cx is not None and sx is not None:
+            distances.append(abs(cx - sx))
+    if not distances:
+        return False
+
+    return min(distances) <= max(22, width * 0.085)
 
 
 def filter_lanes(
@@ -614,24 +841,52 @@ def filter_lanes(
             continue
         if shallow_count == len(lane.segments) and total_len < width * 0.25:
             continue
-        if lane.lane_type == "solid" and span < height * 0.10 and total_len < height * 0.60:
-            continue
         if max_y < height * 0.52 and total_len < height * 0.45:
+            continue
+        if lane_is_probable_noise(lane, image_shape):
             continue
 
         filtered.append(lane)
 
     filtered.sort(key=lambda item: lane_quality_score(item, image_shape), reverse=True)
-    return filtered[: max(1, int(profile.max_lanes))]
+    selected: list[LaneCluster] = []
+    for lane in filtered:
+        if any(lanes_are_duplicate(lane, kept, image_shape) for kept in selected):
+            continue
+        selected.append(lane)
+        if len(selected) >= max(1, int(profile.max_lanes)):
+            break
+    return selected
 
 
-def fit_cluster_line(segments: list[LaneSegment], image_shape: tuple[int, int, int]) -> tuple[int, int, int, int]:
+def fit_cluster_line(
+    segments: list[LaneSegment],
+    image_shape: tuple[int, int, int],
+    profile: DetectionProfile = DEFAULT_PROFILE,
+) -> tuple[int, int, int, int]:
     height, width = image_shape[:2]
     points = []
     for seg in segments:
         points.append([seg.x1, seg.y1])
         points.append([seg.x2, seg.y2])
     pts = np.array(points, dtype=np.float32)
+
+    if profile.enable_ransac and pts.shape[0] >= 6:
+        line = ransac_line(pts, threshold=2.5)
+        if line is not None and line.inliers.sum() >= 4:
+            y_values = [s.y1 for s in segments] + [s.y2 for s in segments]
+            y1 = int(np.clip(min(y_values), 0, height - 1))
+            y2 = int(np.clip(max(y_values), 0, height - 1))
+            x1 = line.x_at_y(y1)
+            x2 = line.x_at_y(y2)
+            if not (math.isnan(x1) or math.isnan(x2)):
+                clipped = cv2.clipLine(
+                    (0, 0, width, height), (int(x1), int(y1)), (int(x2), int(y2))
+                )
+                if clipped[0]:
+                    (x1c, y1c), (x2c, y2c) = clipped[1], clipped[2]
+                    return int(x1c), int(y1c), int(x2c), int(y2c)
+
     vx, vy, x0, y0 = cv2.fitLine(pts, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
 
     y_values = [s.y1 for s in segments] + [s.y2 for s in segments]
@@ -655,6 +910,73 @@ def fit_cluster_line(segments: list[LaneSegment], image_shape: tuple[int, int, i
     return x1, y1, x2, y2
 
 
+def fit_cluster_curve(
+    segments: list[LaneSegment],
+    image_shape: tuple[int, int, int],
+    profile: DetectionProfile,
+) -> tuple[list[tuple[int, int]], bool]:
+    """Return polyline points and ``True`` if a curve fit looks better than a line."""
+    height, width = image_shape[:2]
+    pts: list[list[float]] = []
+    for seg in segments:
+        pts.append([seg.x1, seg.y1])
+        pts.append([seg.x2, seg.y2])
+    arr = np.array(pts, dtype=np.float32)
+
+    if arr.shape[0] < 15:
+        return [], False
+
+    poly = ransac_polynomial(arr, threshold=4.0)
+    if poly is None:
+        return [], False
+
+    inlier_count = int(poly.inliers.sum())
+    line = ransac_line(arr, threshold=2.5)
+    line_inliers = int(line.inliers.sum()) if line is not None else 0
+
+    # A polynomial always fits at least as well as a line (it has an extra
+    # degree of freedom), so a curve is only declared when *all* hold:
+    #   1. the quadratic term is genuinely large (a real bend), and
+    #   2. the poly is not worse than the straight line on inliers, and
+    #   3. the parabola vertex falls outside the sampled span (else it loops).
+    curvature = abs(poly.coeffs[2])
+    if curvature < 3e-3:
+        return [], False
+    if inlier_count + 1 < line_inliers:
+        return [], False
+
+    ys = np.array([s.y1 for s in segments] + [s.y2 for s in segments], dtype=np.float32)
+    y_min = int(np.clip(ys.min(), 0, height - 1))
+    y_max = int(np.clip(ys.max(), 0, height - 1))
+    if y_max - y_min < height * 0.16:
+        return [], False
+
+    c0, c1, c2 = poly.coeffs
+    # Reject parabolas whose vertex (dx/dy = 0) lies inside the sampled range:
+    # those switch back on themselves and render as loops, never real lanes.
+    if abs(c2) > 1e-9:
+        vertex_y = -c1 / (2.0 * c2)
+        if y_min - 5 <= vertex_y <= y_max + 5:
+            return [], False
+
+    sample_ys = np.linspace(y_min, y_max, 16)
+    sample_xs = c0 + c1 * sample_ys + c2 * sample_ys * sample_ys
+
+    # Reject implausible horizontal swing (a lane should not wander more than
+    # ~40% of the frame width across its vertical extent).
+    if float(np.nanmax(sample_xs) - np.nanmin(sample_xs)) > width * 0.45:
+        return [], False
+
+    polyline: list[tuple[int, int]] = []
+    for x, y in zip(sample_xs, sample_ys):
+        if math.isnan(x):
+            continue
+        polyline.append((int(np.clip(round(x), 0, width - 1)), int(np.clip(round(y), 0, height - 1))))
+    if len(polyline) < 4:
+        return [], False
+    return polyline, True
+
+
 def build_clusters(
     segments: list[LaneSegment],
     image_shape: tuple[int, int, int],
@@ -662,15 +984,32 @@ def build_clusters(
 ) -> list[LaneCluster]:
     height, width = image_shape[:2]
     raw_clusters = cluster_segments(segments, (height, width))
+
+    if profile.enable_kmeans:
+        expanded: list[list[LaneSegment]] = []
+        for cluster in raw_clusters:
+            expanded.extend(kmeans_post_split(cluster, (height, width)))
+        raw_clusters = expanded
+
     lanes: list[LaneCluster] = []
     for cluster in raw_clusters:
         if len(cluster) == 1:
             seg = cluster[0]
             if seg.length < height * 0.12 and not is_shallow_mark(seg, (height, width)):
                 continue
-        lane_type = classify_lane(cluster, height, width)
-        fitted = fit_cluster_line(cluster, image_shape)
-        lanes.append(LaneCluster(cluster, lane_type, fitted))
+        fitted = fit_cluster_line(cluster, image_shape, profile)
+        curve_points: list[tuple[int, int]] = []
+        is_curve = False
+        if profile.enable_curve_fit:
+            curve_points, is_curve = fit_cluster_curve(cluster, image_shape, profile)
+        lanes.append(
+            LaneCluster(
+                segments=cluster,
+                fitted_line=fitted,
+                curve_points=curve_points,
+                is_curve=is_curve,
+            )
+        )
 
     merged_clusters: list[list[LaneSegment]] = []
     merge_gap = max(28, int(width * 0.09))
@@ -682,21 +1021,34 @@ def build_clusters(
             cluster_x = float(np.mean([s.x_bottom for s in cluster]))
             cluster_slope = float(np.mean([s.slope for s in cluster]))
             same_side = (avg_slope >= 0) == (cluster_slope >= 0)
-            if same_side and (
-                abs(avg_x - cluster_x) <= merge_gap
-                or clusters_are_close(lane.segments, cluster, image_shape)
-            ):
+            if (
+                same_side
+                and (
+                    abs(avg_x - cluster_x) <= merge_gap
+                    or clusters_are_close(lane.segments, cluster, image_shape)
+                )
+            ) or clusters_are_path_continuation(lane.segments, cluster, image_shape):
                 cluster.extend(lane.segments)
                 placed = True
                 break
         if not placed:
             merged_clusters.append(list(lane.segments))
 
-    merged_lanes = []
+    merged_lanes: list[LaneCluster] = []
     for cluster in merged_clusters:
-        lane_type = classify_lane(cluster, height, width)
-        fitted = fit_cluster_line(cluster, image_shape)
-        merged_lanes.append(LaneCluster(cluster, lane_type, fitted))
+        fitted = fit_cluster_line(cluster, image_shape, profile)
+        curve_points: list[tuple[int, int]] = []
+        is_curve = False
+        if profile.enable_curve_fit:
+            curve_points, is_curve = fit_cluster_curve(cluster, image_shape, profile)
+        merged_lanes.append(
+            LaneCluster(
+                segments=cluster,
+                fitted_line=fitted,
+                curve_points=curve_points,
+                is_curve=is_curve,
+            )
+        )
     return filter_lanes(merged_lanes, image_shape, profile)
 
 
@@ -711,50 +1063,11 @@ def draw_lanes(
     height, width = image.shape[:2]
 
     for lane in lanes:
-        color = (0, 220, 0) if lane.lane_type == "solid" else (0, 0, 255)
+        color = (0, 220, 0)
 
-        if lane.lane_type == "dashed":
-            for group in segment_groups_by_y(lane.segments, merge_gap=8):
-                usable = []
-                for seg in group:
-                    center_y = (seg.y1 + seg.y2) / 2
-                    long_flat_mark = (
-                        is_shallow_mark(seg, (height, width))
-                        and (seg.length > width * 0.10 or center_y < height * 0.55)
-                    )
-                    if seg.length >= 5 and not long_flat_mark:
-                        usable.append(seg)
-
-                if not usable:
-                    continue
-                if len(usable) == 1:
-                    seg = usable[0]
-                    cv2.line(overlay, (seg.x1, seg.y1), (seg.x2, seg.y2), color, 4, cv2.LINE_AA)
-                    continue
-
-                x1, y1, x2, y2 = fit_cluster_line(usable, image.shape)
-                if abs(y2 - y1) <= 2:
-                    xs = [s.x1 for s in usable] + [s.x2 for s in usable]
-                    ys = [s.y1 for s in usable] + [s.y2 for s in usable]
-                    if max(xs) - min(xs) > width * 0.18:
-                        continue
-                    y = int(np.clip(round(float(np.mean(ys))), 0, height - 1))
-                    x1 = int(np.clip(min(xs), 0, width - 1))
-                    x2 = int(np.clip(max(xs), 0, width - 1))
-                    if abs(x2 - x1) < 5:
-                        continue
-                    cv2.line(overlay, (x1, y), (x2, y), color, 4, cv2.LINE_AA)
-                    continue
-
-                if y2 < y1:
-                    x1, y1, x2, y2 = x2, y2, x1, y1
-                line_length = math.hypot(x2 - x1, y2 - y1)
-                group_ys = [s.y1 for s in usable] + [s.y2 for s in usable]
-                if line_length < 5:
-                    continue
-                if line_length > width * 0.34 and (max(group_ys) - min(group_ys)) < height * 0.18:
-                    continue
-                cv2.line(overlay, (x1, y1), (x2, y2), color, 4, cv2.LINE_AA)
+        if lane.is_curve and len(lane.curve_points) >= 2:
+            pts = np.array(lane.curve_points, dtype=np.int32).reshape(-1, 1, 2)
+            cv2.polylines(overlay, [pts], False, (255, 180, 60), 5, cv2.LINE_AA)
             continue
 
         x1, y1, x2, y2 = lane.fitted_line
@@ -787,41 +1100,58 @@ def detect_lanes(
     return annotated, lanes, edge_mask
 
 
-def process_images(input_path: Path, output_dir: Path) -> None:
+def process_images(input_path: Path, output_dir: Path, use_auto_profile: bool = True) -> None:
     images = list_images(input_path)
     if not images:
         raise FileNotFoundError(f"No images found in: {input_path}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     rows = []
+    auto_detector = None
+    if use_auto_profile:
+        try:
+            from lane_profile_router import detect_auto
+
+            auto_detector = detect_auto
+        except Exception:
+            auto_detector = None
+
     for image_path in images:
         image = imread_unicode(image_path)
         if image is None:
             print(f"[skip] cannot read: {image_path}")
             continue
 
-        annotated, lanes, _ = detect_lanes(image)
+        profile_key = DEFAULT_PROFILE.key
+        profile_label = DEFAULT_PROFILE.label
+        if auto_detector is not None:
+            annotated, lanes, _, decision = auto_detector(image)
+            profile_key = decision.key
+            profile_label = decision.label
+        else:
+            annotated, lanes, _ = detect_lanes(image)
         relative = image_path.name if input_path.is_file() else image_path.relative_to(input_path)
         save_path = (output_dir / relative).with_suffix(".png")
         imwrite_unicode(save_path, annotated)
 
-        solid_count = sum(1 for lane in lanes if lane.lane_type == "solid")
-        dashed_count = sum(1 for lane in lanes if lane.lane_type == "dashed")
         rows.append(
             {
                 "image": str(relative),
-                "solid_count": solid_count,
-                "dashed_count": dashed_count,
                 "total_count": len(lanes),
+                "profile_key": profile_key,
+                "profile_label": profile_label,
                 "output": str(save_path),
             }
         )
-        print(f"[ok] {relative}: solid={solid_count}, dashed={dashed_count}, output={save_path}")
+        print(
+            f"[ok] {relative}: lanes={len(lanes)}, "
+            f"profile={profile_key}, output={save_path}"
+        )
 
     report_path = output_dir / "lane_detection_report.csv"
     with report_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["image", "solid_count", "dashed_count", "total_count", "output"]
+            f, fieldnames=["image", "total_count", "profile_key", "profile_label", "output"]
         )
         writer.writeheader()
         writer.writerows(rows)
@@ -830,7 +1160,7 @@ def process_images(input_path: Path, output_dir: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Detect lane lines in road images and classify them as solid or dashed."
+        description="Detect lane lines in road images."
     )
     parser.add_argument(
         "input",
@@ -844,12 +1174,17 @@ def parse_args() -> argparse.Namespace:
         default="lane_detection_output",
         help="Folder for annotated images and CSV report.",
     )
+    parser.add_argument(
+        "--no-auto-profile",
+        action="store_true",
+        help="Use the default profile instead of the automatic scene router.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    process_images(Path(args.input), Path(args.output))
+    process_images(Path(args.input), Path(args.output), not args.no_auto_profile)
 
 
 if __name__ == "__main__":

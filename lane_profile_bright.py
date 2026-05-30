@@ -23,6 +23,10 @@ PROFILE = DetectionProfile(
     use_mask_components=False,
     min_angle=12.0,
     hough_passes=((24, 20, 6), (16, 16, 5), (10, 12, 4)),
+    enable_ransac=True,
+    enable_kmeans=True,
+    enable_curve_fit=True,
+    enable_cnn=False,
 )
 
 
